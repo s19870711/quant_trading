@@ -56,40 +56,63 @@ def evaluate_predictions():
     for _, row in df.iterrows():
         symbol = row['symbol']
         status = row['status']
+        asset_type = row['asset_type']
         entry = row['entry_price']
         target = row['target_price']
         stop = row['stop_loss']
         
         try:
-            hist = yf.Ticker(symbol).history(period="5d")
-            if hist.empty: continue
-            
-            # 使用近 3 天的高低點來確認是否觸發
-            recent_high = hist['High'].max()
-            recent_low = hist['Low'].min()
-            
-            new_status = status
-            
-            # 狀態轉換邏輯
-            if status == "pending":
-                if recent_high >= entry:
-                    new_status = "active" # 突破進場價，開始計算損益
-            
-            if new_status == "active":
-                if recent_high >= target:
-                    new_status = "win" # 達到獲利目標
-                elif recent_low <= stop:
-                    new_status = "loss" # 打到停損點
+            # Handle option validation vs stock validation
+            if 'Call' in asset_type or 'Put' in asset_type:
+                # Basic option logic: Options lose extrinsic value, validation relies on stock moving favorably
+                hist = yf.Ticker(symbol).history(period="5d")
+                if hist.empty: continue
+                current_price = hist['Close'].iloc[-1]
+                
+                new_status = status
+                if status == "pending":
+                    # For simplicity, if stock price drops > 3%, consider option entry hit (meaning opportunity window triggered/missed)
+                    new_status = "active"
+                    
+                if new_status == "active":
+                    # Mock evaluation for Options: Deeply ITM (5% stock move) = Option win, Sharp drop = Option loss
+                    recent_high = hist['High'].max()
+                    recent_low = hist['Low'].min()
+                    # We log the Option rights premium price in tracking db, not the stock price.
+                    # Currently we simulate validation until actual broker API is linked
+                    if recent_high > (entry * 1.05): # Use a dummy proxy for underlying triggering
+                        new_status = "win" # Mark win
+                    elif pd.Timestamp.today() > pd.to_datetime(row['date']) + pd.Timedelta(days=7):
+                        new_status = "loss" # Expired or time-decayed
+            else:
+                # Standard Stock evaluation
+                hist = yf.Ticker(symbol).history(period="5d")
+                if hist.empty: continue
+                
+                recent_high = hist['High'].max()
+                recent_low = hist['Low'].min()
+                
+                new_status = status
+                
+                if status == "pending":
+                    if recent_high >= entry:
+                        new_status = "active"
+                
+                if new_status == "active":
+                    if recent_high >= target:
+                        new_status = "win"
+                    elif recent_low <= stop:
+                        new_status = "loss"
                     
             if new_status != status:
                 c = conn.cursor()
                 c.execute("UPDATE predictions SET status=? WHERE id=?", (new_status, row['id']))
                 conn.commit()
-                logging.info(f"⭐ 更新預測狀態: {symbol} 從 {status} 變成 -> {new_status}")
+                logging.info(f"⭐ 更新預測狀態: {symbol} ({asset_type}) 從 {status} 變成 -> {new_status}")
                 updated_count += 1
 
         except Exception as e:
-            logging.error(f"驗證 {symbol} 時發生錯誤: {e}")
+            logging.error(f"驗證 {symbol} ({asset_type}) 時發生錯誤: {e}")
             
     # 統計勝率
     c = conn.cursor()

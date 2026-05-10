@@ -31,11 +31,11 @@ class OptionsAnalyzer:
                     logging.info(f"  {clean_symbol}: 缺乏期權流動性數據")
                     continue
                     
-                # Look for an expiration 30-45 days out (Optimal for swing trades)
+                # Look for an expiration 7-45 days out (Swing trades, min 7 days requested)
                 target_date = None
                 for date_str in expirations:
                     days_to_exp = (pd.to_datetime(date_str) - pd.Timestamp.today()).days
-                    if 20 <= days_to_exp <= 50:
+                    if 7 <= days_to_exp <= 45:
                         target_date = date_str
                         break
                         
