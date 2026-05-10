@@ -2,6 +2,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
+import json
+import os
 from bs4 import BeautifulSoup
 import ta
 from datetime import datetime, timedelta
@@ -20,24 +22,32 @@ class Screener:
         
     def _get_small_mid_cap_tickers(self):
         try:
-            logging.info("Fetching S&P 400 MidCap and S&P 600 SmallCap tickers from Wikipedia...")
-            # S&P 400 MidCap
-            df_400 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies")[0]
-            tickers_400 = df_400['Symbol'].tolist()
+            logging.info("Reading local list of US stock tickers...")
+            tickers = []
             
-            # S&P 600 SmallCap
-            df_600 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies")[0]
-            tickers_600 = df_600['Symbol'].tolist()
-            
-            tickers = tickers_400 + tickers_600
-            
-            # Clean up tickers for Yahoo Finance (e.g., BRK.B -> BRK-B)
+            # Load S&P 500 list
+            sp500_path = os.path.expanduser("~/quant_trading/data/sp500.json")
+            if os.path.exists(sp500_path):
+                with open(sp500_path, 'r') as f:
+                    data = json.load(f)
+                    tickers.extend(data)
+                    
+            # Set a dynamic limit to avoid 2-hour scan runs during testing.
+            # Real deployment might scan all 3000+, but let's take a sample of 200 liquid names first
+            tickers = list(set(tickers))
             tickers = [str(t).replace('.', '-') for t in tickers if isinstance(t, str)]
             
-            logging.info(f"Successfully loaded {len(tickers)} Small/Mid-Cap tickers.")
+            # Filter the list size
+            max_scan = 1000 # Allow all standard tickers
+            if len(tickers) > max_scan:
+                tickers = tickers[:max_scan]
+                
+            logging.info(f"Successfully loaded {len(tickers)} tickers from local datastore for scanning.")
+            if not tickers:
+                raise ValueError("No tickers loaded from JSON")
             return tickers
         except Exception as e:
-            logging.error(f"Failed to fetch Small/Mid-Cap tickers: {e}")
+            logging.error(f"Failed to fetch local ticker files: {e}")
             # Fallback to a basket of known high-beta / growth mid-caps
             return [
                 "CELH", "SMCI", "PLTR", "UPST", "MSTR", "ELF", "SYM", "CVNA", 
@@ -47,19 +57,44 @@ class Screener:
         
     def fetch_data(self, period="1y"):
         logging.info(f"Fetching data for {len(self.tickers)} tickers...")
-        # Download all tickers at once for efficiency
-        data = yf.download(self.tickers, period=period, group_by='ticker', auto_adjust=True, progress=False)
-        self.data_dict = {}
-        
-        for ticker in self.tickers:
-            if isinstance(data.columns, pd.MultiIndex):
-                 df = data[ticker].copy()
-            else:
-                 df = data.copy()
+        def fetch_data_in_chunks(tickers, chunk_size=50):
+            data_dict = {}
+            for i in range(0, len(tickers), chunk_size):
+                chunk = tickers[i:i+chunk_size]
+                logging.info(f"Downloading chunk {i//chunk_size + 1}/{(len(tickers)-1)//chunk_size + 1}...")
+                try:
+                    # Using threads=True but chunked to avoid Yahoo Finance IP rate limits
+                    data = yf.download(chunk, period=period, group_by='ticker', auto_adjust=True, progress=False, threads=False)
+                    for ticker in chunk:
+                        if len(chunk) == 1:
+                            df = data.copy()
+                            if isinstance(df, pd.DataFrame) and 'Close' in df.columns:
+                                df.dropna(inplace=True)
+                                if len(df) > 50 and df['Close'].iloc[-1] > 0 and not pd.isna(df['Close'].iloc[-1]):
+                                    data_dict[ticker] = df
+                            continue
+                        elif isinstance(data.columns, pd.MultiIndex):
+                            if ticker in data.columns.levels[0]:
+                                df = data[ticker].copy()
+                            else:
+                                continue
+                        else:
+                            continue
+                            
+                        df.dropna(inplace=True)
+                        if len(df) > 50:
+                            if df['Close'].iloc[-1] > 0 and not pd.isna(df['Close'].iloc[-1]):
+                                data_dict[ticker] = df
+                except Exception as e:
+                    logging.warning(f"Error fetching chunk: {e}")
+                
+                # Sleep to respect rate limits
+                import time
+                time.sleep(2)
             
-            df.dropna(inplace=True)
-            if len(df) > 50: # Require at least 50 days of data
-                self.data_dict[ticker] = df
+            return data_dict
+
+        self.data_dict = fetch_data_in_chunks(self.tickers)
 
     def calculate_vcp_rules(self, ticker, df):
         """
@@ -76,50 +111,63 @@ class Screener:
             df['SMA_150'] = close.rolling(window=150).mean()
             df['SMA_200'] = close.rolling(window=200).mean()
             
-            high_52w = close.rolling(window=252).max().iloc[-1]
-            low_52w = close.rolling(window=252).min().iloc[-1]
+            # Fix calculating 52-week high/low with pandas rolling issue (NaNs at the end)
+            high_52w = df['Close'].tail(252).max()
+            low_52w = df['Close'].tail(252).min()
             
             current_close = close.iloc[-1]
             sma50 = df['SMA_50'].iloc[-1]
             sma150 = df['SMA_150'].iloc[-1]
             sma200 = df['SMA_200'].iloc[-1]
             
+            # 200 SMA trending up 1-month
             sma200_20days_ago = df['SMA_200'].iloc[-20] if len(df) > 200 else float('inf')
 
+            # Calculate conditions, VCP Style rules restored and integrated with ADX/RS Rating
             condition_1 = current_close > sma150 and current_close > sma200
             condition_2 = sma150 > sma200
-            condition_3 = sma200 > sma200_20days_ago
-            condition_4 = sma50 > sma150 and sma50 > sma200
-            condition_5 = current_close > sma50
-            condition_6 = current_close >= (low_52w * 1.30)
-            condition_7 = current_close >= (high_52w * 0.75)
+            condition_3 = sma50 > sma150 and sma50 > sma200
+            
+            # Condition 4: Current Price > 50-day SMA
+            condition_4 = current_close > sma50
+            
+            # Must be near new highs for genuine VCP
+            condition_5 = current_close >= (high_52w * 0.85) # Within 15% of 52-week high
+            condition_6 = current_close >= (low_52w * 1.30)  # Up 30% from 52-week low
             
             # --- High Star Strategy 1: ADX Momentum Filter ---
-            # Using 'ta' library to calculate ADX. Generally ADX > 20 means strong trend.
-            adx_indicator = ta.trend.ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
-            df['ADX'] = adx_indicator.adx()
-            current_adx = df['ADX'].iloc[-1]
-            condition_adx = current_adx >= 20
-            
-            # --- High Star Strategy 2: Relative Strength (Simplified vs SPY) ---
-            # Does the stock significantly outperform SPY over a 6-month (126 days) window?
             try:
-                spy_df = self.data_dict['SPY']
-                stock_return = (current_close / close.iloc[-126]) - 1
-                spy_return = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-126]) - 1
-                condition_rs = stock_return > (spy_return * 1.5) # Outperform SPY by 50%
+                adx_indicator = ta.trend.ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
+                df['ADX'] = adx_indicator.adx()
+                current_adx = df['ADX'].iloc[-1]
+                condition_adx = pd.notna(current_adx) and current_adx >= 25 # Increased strictness back to strong trend
             except Exception:
-                condition_rs = True # Bypass if SPY data missing
-            
-            # --- Volume Contraction Check ---
-            vol_50d_avg = df['Volume'].rolling(window=50).mean().iloc[-1]
+                condition_adx = False
+                
+            # --- High Star Strategy 2: Relative Strength (Simplified vs SPY) ---
+            try:
+                spy_df = self.data_dict.get('SPY')
+                if spy_df is None or len(spy_df) < 126:
+                    condition_rs = True
+                else:
+                    stock_return = (current_close / close.iloc[-126]) - 1
+                    spy_return = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-126]) - 1
+                    condition_rs = stock_return > spy_return # Must outperform SPY naturally without relaxing
+            except Exception:
+                condition_rs = True 
+
+            # Condition 7: Volume Contraction check VCP style
+            vol_50d_avg = df['Volume'].tail(50).mean()
             vol_last_5d_max = df['Volume'].tail(5).max()
-            # Relaxed for initial pool building
-            condition_8 = vol_last_5d_max < vol_50d_avg * 1.8 
+            vol_last_3d_min = df['Volume'].tail(3).min()
+            
+            # VCP requires both: recent dry up AND not massive selling volume lately
+            condition_7_dry = vol_last_3d_min < (vol_50d_avg * 0.65) # Strict dry up
+            condition_7_cap = vol_last_5d_max < (vol_50d_avg * 1.25) # No recent massive selling
+            condition_7 = condition_7_dry and condition_7_cap
 
             if (condition_1 and condition_2 and condition_3 and condition_4 and 
-                condition_5 and condition_6 and condition_7 and condition_8 and 
-                condition_adx and condition_rs):
+                condition_5 and condition_6 and condition_7 and condition_adx and condition_rs):
                 return True
         except Exception as e:
             return False
@@ -131,7 +179,10 @@ class Screener:
         candidates = []
         for ticker, df in self.data_dict.items():
             if self.calculate_vcp_rules(ticker, df):
-                candidates.append(ticker)
+                # Calculate basic context metrics to append to output
+                close = df['Close'].iloc[-1]
+                adx = df['ADX'].iloc[-1] if 'ADX' in df.columns else 0
+                candidates.append(f"{ticker} (ADX: {adx:.1f}, P: ${close:.2f})")
         
         logging.info(f"Found {len(candidates)} high-probability candidates: {candidates}")
         return candidates
