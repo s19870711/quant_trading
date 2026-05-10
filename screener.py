@@ -195,8 +195,17 @@ class Screener:
                 
                 plan = f"{ticker} | 突破買入: ${entry_price:.2f} | 停損: ${stop_loss:.2f} | 停利: ${target_price:.2f} | ADX: {adx:.1f}"
                 candidates.append(plan)
+                
+                # 自動記錄至資料庫，進行追蹤與機器學習自我優化
+                try:
+                    import sys
+                    sys.path.append(os.path.expanduser("~/quant_trading"))
+                    from performance_tracker import log_prediction
+                    log_prediction(ticker, "stock", entry_price, stop_loss, target_price, f"ADX: {adx:.1f}")
+                except Exception as e:
+                    logging.warning(f"Failed to log prediction to db: {e}")
         
-        logging.info(f"Found {len(candidates)} high-probability candidates: {candidates}")
+        logging.info(f"Found {len(candidates)} high-probability candidates: {str(candidates)}")
         return candidates
 
 if __name__ == "__main__":
