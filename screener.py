@@ -179,10 +179,22 @@ class Screener:
         candidates = []
         for ticker, df in self.data_dict.items():
             if self.calculate_vcp_rules(ticker, df):
-                # Calculate basic context metrics to append to output
+                # Calculate Trade Plan based on VCP breakout
                 close = df['Close'].iloc[-1]
                 adx = df['ADX'].iloc[-1] if 'ADX' in df.columns else 0
-                candidates.append(f"{ticker} (ADX: {adx:.1f}, P: ${close:.2f})")
+                
+                recent_high = df['High'].tail(5).max()
+                recent_low = df['Low'].tail(5).min()
+                
+                entry_price = recent_high * 1.002 # Breakout trigger (slightly above 5-day base)
+                stop_loss = recent_low * 0.99 # Stop just below 5-day base
+                if (entry_price - stop_loss) / entry_price > 0.08:
+                    stop_loss = entry_price * 0.92 # Max 8% risk stop
+                    
+                target_price = entry_price + ((entry_price - stop_loss) * 2.5) # 1:2.5 Risk/Reward ratio
+                
+                plan = f"{ticker} | 突破買入: ${entry_price:.2f} | 停損: ${stop_loss:.2f} | 停利: ${target_price:.2f} | ADX: {adx:.1f}"
+                candidates.append(plan)
         
         logging.info(f"Found {len(candidates)} high-probability candidates: {candidates}")
         return candidates
